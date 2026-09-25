@@ -5,7 +5,7 @@ use core::fmt;
 use opentelemetry::global;
 use opentelemetry::metrics::Counter;
 use opentelemetry_instrumentation_actix_web::ClientExt;
-use std::sync::LazyLock;
+use std::sync::{LazyLock, Mutex};
 use std::{collections::HashMap, env};
 
 use anyhow::{Context, Result};
@@ -20,6 +20,11 @@ static ITEMS_SHIPPED_COUNTER: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .build()
 });
 
+// Item counts from recent orders, used to flag orders that request an
+// unusually large number of items relative to what the service has recently
+// quoted.
+static RECENT_ORDER_ITEM_COUNTS: LazyLock<Mutex<Vec<u32>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+
 pub async fn create_quote_from_count(count: u32) -> Result<Quote, tonic::Status> {
     let f = match request_quote(count).await {
         Ok(float) => float,
@@ -30,6 +35,8 @@ pub async fn create_quote_from_count(count: u32) -> Result<Quote, tonic::Status>
     };
 
     ITEMS_SHIPPED_COUNTER.add(count as u64, &[]);
+
+    flag_unusual_item_count(count);
 
     Ok(get_active_span(|span| {
         let q = create_quote_from_float(f);
@@ -86,6 +93,28 @@ async fn request_quote(count: u32) -> Result<f64, anyhow::Error> {
         .context("Failed to parse quote value as f64")?;
 
     Ok(f)
+}
+
+// Compares this request's item count against the running average of all
+// prior requests, then records the count for future comparisons.
+fn flag_unusual_item_count(count: u32) {
+    let mut history = RECENT_ORDER_ITEM_COUNTS
+        .lock()
+        .expect("order item history lock poisoned");
+
+    if !history.is_empty() {
+        let average = history.iter().sum::<u32>() as f64 / history.len() as f64;
+        if count as f64 > average * 10.0 {
+            get_active_span(|span| {
+                span.add_event(
+                    "shipping.quote.unusual_item_count".to_string(),
+                    vec![KeyValue::new("demo.shipping.items.count", count as i64)],
+                );
+            });
+        }
+    }
+
+    history.push(count);
 }
 
 pub fn create_quote_from_float(value: f64) -> Quote {
